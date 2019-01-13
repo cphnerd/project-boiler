@@ -1,0 +1,312 @@
+// Adafruit IO Publish Example
+//
+// Adafruit invests time and resources providing this open source code.
+// Please support Adafruit and open source hardware by purchasing
+// products from Adafruit!
+//
+// Written by Todd Treece for Adafruit Industries
+// Copyright (c) 2016 Adafruit Industries
+// Licensed under the MIT license.
+//
+// All text above must be included in any redistribution.
+
+/************************** Configuration ***********************************/
+
+// edit the config.h tab and enter your Adafruit IO credentials
+// and any additional configuration needed for WiFi, cellular,
+// or ethernet clients.
+#include "config.h"
+#include <HX711_ADC.h>
+#include <DHTesp.h>
+#include <EEPROM.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+
+// pins LOW SIDE
+  int Dtx    =  1; // TX - GPIO 1 - negated
+  int Drx    =  3; // RX - GPIO 3
+//int DIO1   =  5; // D1 - GPIO 5 / (I2C: SCL)  - Dallas
+  int DIO2   =  4; // D2 - GPIO 4 / (I2C: SDA) - for temp and humidity
+  int DIO3   =  0; // D3 - GPIO 0 / used by the programmer - watch out for this pin !
+  int DIO4   =  2; // D4 - GPIO 2 / Blue led on ESP - optional relay output
+  // GROUND
+  // 5V USB supply
+
+// pins HIGH SIDE  (reset button side)
+  // RST
+  int Ain    = A0; // ADC 0 analog input - used for pressure gauge
+  int DIO0   = 16; // D0 - GPIO 16
+  int DIO5   = 14; // D5 - GPIO 14 (SPI: CLK) - D5: SCK pin for scale
+  int DIO6   = 12; // D6 - GPIO 12 (SPI: MISO) - D6: DT pin for scale
+  int DI7    = 13; // D7 - GPIO 13 (SPI: MOSI) - zero scale ajust
+  int DI8    = 15; // D8 - GPIO 15 (SPI: SS/CS) - max scale adjust
+  // 3,3V VCC voltage
+
+// track time of last published messages and limit feed->save events to once
+// every IO_LOOP_DELAY milliseconds
+  #define IO_LOOP_DELAY 15000
+  unsigned long lastUpdate;
+
+// variables
+// EEPROM
+  int TareAdr = 0;
+  int CalAdr = 64;
+  float ScaleTare = 0;
+  float ScaleCal = 5000.0;
+  float SiloLevel;
+  float LastSiloLevel;
+  float Scale;
+  bool ScaleCalibrated;
+  int SiloTemp;
+  int SiloRH;
+  int TempForward;
+  int TempReturn;
+  int Pressure;  
+  String Status = "rebooted";
+  String PreviousStatus;
+  int Seriousness = 10;
+  bool relaystate;
+
+// set up the feeds
+  AdafruitIO_Feed *silolevel = io.feed("heating-system.silolevel");           //HX711 scale
+  AdafruitIO_Feed *silotemp = io.feed("heating-system.silotemp");             //DHT11 temperature of the silo
+  AdafruitIO_Feed *silohumid = io.feed("heating-system.silohumid");           //DHT11 humidity of the silo
+  AdafruitIO_Feed *tempforward = io.feed("heating-system.tempforward");       //Dallas 18D20 temp hotwater forward
+  AdafruitIO_Feed *tempreturn = io.feed("heating-system.tempreturn");         //Dallas 18D20 temp hotwater return
+  AdafruitIO_Feed *waterpressure = io.feed("heating-system.waterpressure");   //Analog pressure gauge
+  AdafruitIO_Feed *statusMSG = io.feed("heating-system.statusmsg");           //used for creating messages on the IFTTT
+  AdafruitIO_Feed *relay = io.feed("heating-system.relay");                   //used for an optional relay output (also blue LED on ESP)
+
+
+// set up various sensors
+  HX711_ADC SiloScale(DIO6, DIO5);  //HX711_ADC constructor (dout pin, sck pin);
+  DHTesp SiloDHT;
+  #define ONE_WIRE_BUS 5 // D1
+  OneWire oneWire(ONE_WIRE_BUS);
+  DallasTemperature Dallas(&oneWire);
+
+
+void setup() {
+// initialize inputs and included libraries
+  // pins for direct IO's
+    pinMode(Ain, INPUT);        // voltage divided to 50% of pressure gauge (1V max)
+    pinMode(DI8, INPUT_PULLUP); // button closest to the corner for zero silolevel adj
+    pinMode(DI7, INPUT_PULLUP); // button max silolevel adj
+    pinMode(DIO4, OUTPUT);      // LED + optional relay
+
+  // start the serial connection
+    Serial.begin(115200);
+
+  // EEprom to save the scale min/max values
+    EEPROM.begin(128);
+    EEPROM.get(TareAdr, ScaleTare);
+    EEPROM.get(CalAdr, ScaleCal);
+    printEEpromvalues();
+    
+  // Load cell for getting the fill-level of the silo
+    SiloScale.begin();
+    SiloScale.start(2000);
+    
+    if (ScaleTare == 0) {
+      SiloScale.start(2000);
+  //    SiloScale.setCalFactor(1000);
+      SiloScale.tareNoDelay();
+      Serial.println("Setting initial tare and scale values");
+    }
+    else {
+      SiloScale.setTareOffset(ScaleTare);
+      SiloScale.setCalFactor(ScaleCal);
+      Serial.println("Setting saved tare and scale values from EEPROM");
+    }
+    
+  // temp and humidity sensor located inside the silo
+    SiloDHT.setup(DIO2, DHTesp::DHT11);
+
+  // Dallas DS18B20 onewire temperature sensors for water temperature
+    pinMode(ONE_WIRE_BUS, INPUT);
+    Dallas.begin();
+    Dallas.setResolution(12);
+
+  // connect to io.adafruit.com
+    Serial.print("Connecting to Adafruit IO");
+    io.connect();
+    relay->onMessage(handleRelay);
+
+  // wait for a connection
+    while(io.status() < AIO_CONNECTED) {
+      Serial.print(".");
+      delay(500);
+    }
+
+  // we are connected
+    Serial.println();
+    Serial.println(io.statusText());
+    relay->get();
+    io.run();
+    statusMSG->save(Status); // send the status message to IO
+
+}
+
+void loop() {
+
+  // io.run(); is required for all sketches.
+  // it should always be present at the top of your loop
+  // function. it keeps the client connected to
+  // io.adafruit.com, and processes any incoming data.
+    io.run();
+    SiloScale.update();
+
+  if (millis() > (lastUpdate + IO_LOOP_DELAY)) {
+    Serial.print(millis());
+    Serial.print("\tRelay: ");
+    Serial.print(relaystate);
+    Serial.print("\tSiloTemp: ");
+    
+  //Get sensor values
+    // temp and humidity
+      TempAndHumidity lastValues = SiloDHT.getTempAndHumidity();
+      SiloTemp = lastValues.temperature;
+      SiloRH = lastValues.humidity;
+      silotemp->save(SiloTemp);  // Adafruit send messsage / value to server
+      silohumid->save(SiloRH);  // Adafruit send messsage / value to server
+      Serial.print(SiloTemp);
+      Serial.print("\t SiloRH: ");
+      Serial.print(SiloRH);
+      Serial.print("\t Scale: ");
+      
+    //weight  
+      SiloLevel = SiloScale.getData();    
+      if (SiloLevel < (LastSiloLevel * 0.8)) SiloLevel = SiloScale.getData(); // resample upon a 20% drop
+      LastSiloLevel = SiloLevel;  // saving new sample for the filtering
+      silolevel->save(SiloLevel); // Adafruit send messsage / value to server
+      Serial.print(SiloLevel);
+      Serial.print("\t Forward: ");
+    
+    // Dallas 18D20 temperature sensors
+      TempForward = read_Dallas(0);
+      TempReturn = read_Dallas(1);
+      tempforward->save(TempForward); // Adafruit send messsage / value to server
+      tempreturn->save(TempReturn);  // Adafruit send messsage / value to server
+      Serial.print(TempForward);
+      Serial.print("\t Return: ");
+      Serial.print(TempReturn);
+      Serial.print("\t Pressure: ");
+  
+    // Pressure sensor
+      Pressure = analogRead(Ain);
+      waterpressure->save(Pressure);
+      Serial.print(Pressure);
+      Serial.print("\t Status: ");
+  
+    // status message
+    if (SiloLevel <= 50 && Seriousness > 9)     {Status = "OBS: Silo <= 50%"; Seriousness--; }
+    if (SiloLevel <= 25 && Seriousness > 8)     {Status = "Alarm: Silo <= 25% \n påfyldning krævet"; Seriousness--; }
+    if (TempForward <= 38 && Seriousness > 7)   {Status = "OBS: Fremløbstemperatur <= 40"; Seriousness--; } 
+    if (TempForward <= 30 && Seriousness > 6)   {Status = "Alarm: Fremløbstemperatur <= 30 \n fyret er slukket"; Seriousness--; } 
+    if (TempForward <= 25 && Seriousness > 5)    {Status = "Alarm: Returtemperatur <= 25 \n huset er iskoldt"; Seriousness--; }
+    if (Pressure <= 120 && Seriousness > 4)     {Status = "Alarm: lavt vandtryk"; Seriousness--; }
+    if (SiloLevel > 50 && TempForward > 40 && Pressure > 170) {Status = "Alt ok"; Seriousness = 10; }
+    Serial.println(Status);
+
+    if (Status != PreviousStatus) {statusMSG->save(Seriousness + ": " + Status); PreviousStatus = Status; }
+    
+    // update timer
+    lastUpdate = millis();
+  }
+
+    // scale calibration
+      if (Serial.available() > 0) {
+        char inByte = Serial.read();
+        if (inByte == 't') changeTareValue();
+        else if (inByte == 'c') changeCalFactor();
+        else if (inByte == 'd') defaultCalFactor();
+      }  
+ }
+
+// function to get the data from Dallas temperature sensors by ID
+float read_Dallas(int ID) {
+  Dallas.requestTemperatures();
+  float TempC = Dallas.getTempCByIndex(ID);
+}
+
+// this function is called whenever an 'digital' feed message
+// is received from Adafruit IO. it was attached to
+// the 'digital' feed in the setup() function above.
+void handleRelay(AdafruitIO_Data *inputdata) {
+
+  Serial.print("received <- ");
+  Serial.print(inputdata->toString());
+
+  if(inputdata->toString() == "ON") {
+    Serial.println(": HIGH");
+    relaystate = HIGH;
+    }
+  if(inputdata->toString() == "OFF") {
+    Serial.println(": LOW");
+    relaystate = LOW;
+    }
+  if(inputdata->toString() == "Toggle") {
+    Serial.println(": Toggle output");
+    relaystate = !relaystate;
+    }
+  if (inputdata->toString() == "t") changeTareValue();
+  if (inputdata->toString() == "c") changeCalFactor();
+  if (inputdata->toString() == "d") defaultCalFactor();
+    
+    digitalWrite(DIO4, !relaystate); 
+}
+
+void changeTareValue() {
+  SiloScale.tareNoDelay();
+  ScaleTare = SiloScale.getTareOffset();
+  saveToEEPROM();
+}
+  
+void changeCalFactor() {
+  float m = 0; // mass 
+  if (Serial.available() > 0) {
+    m = Serial.parseFloat(); // setting customized calibration value
+    if (m == 0) {
+      m = 100; // setting default 100 (percent of scale)
+      Serial.println("Setting default 100% scale");
+    } 
+    else
+    {
+      Serial.print("Setting the scale value to ");
+      Serial.println(m);
+    }
+//    if (isnan(SiloScale.getData())){
+//      ScaleCal = 1000;}  // to clear the calculation error in case of bad result  
+//    else {  
+    ScaleCal = SiloScale.getData() * SiloScale.getCalFactor() / m;
+//    }
+    SiloScale.setCalFactor(ScaleCal);
+    saveToEEPROM();
+  }
+}
+
+void defaultCalFactor() {
+      Serial.println("Defaulting the scale values");
+      SiloScale.tareNoDelay();
+      ScaleTare = SiloScale.getTareOffset(); 
+      ScaleCal = 1000;
+      SiloScale.setCalFactor(ScaleCal);
+      saveToEEPROM();
+  
+}
+void saveToEEPROM() {
+  EEPROM.put(TareAdr, ScaleTare);
+  EEPROM.put(CalAdr, ScaleCal);
+  EEPROM.commit();
+  Serial.println("scale calibration values saved to EEPROM");
+  printEEpromvalues();  
+}
+
+void printEEpromvalues() {
+    Serial.print("EEPROM Tare: ");
+    Serial.println(ScaleTare);
+    Serial.print("EEPROM Cal value: ");
+    Serial.println(ScaleCal);
+
+}
